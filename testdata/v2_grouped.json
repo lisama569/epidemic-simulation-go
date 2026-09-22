@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "paradigm": "grouped",
+  "model_type": "seir",
+  "horizon_days": 120,
+  "step_days": 0.5,
+  "seed": 42,
+  "beta": 0.5,
+  "sigma": 0.2,
+  "gamma": 0.1,
+  "gamma_q": 0.15,
+  "groups": [
+    {"id": "young", "size": 8000, "init_s": 7990, "init_e": 0, "init_i": 10, "init_q": 0, "init_r": 0},
+    {"id": "old",   "size": 2000, "init_s": 1996, "init_e": 0, "init_i": 4,  "init_q": 0, "init_r": 0}
+  ],
+  "contacts": [[0.9, 0.2], [0.2, 0.4]],
+  "interventions": [
+    {"kind": "contact_reduction", "start_day": 10, "end_day": 30, "compliance": 0.8, "strength": 0.7},
+    {"kind": "vaccination", "start_day": 5, "end_day": 45, "compliance": 1, "rate": 0.2, "capacity": 40, "groups": [1]},
+    {"kind": "isolation", "start_day": 15, "end_day": 60, "compliance": 0.9, "rate": 0.15, "capacity": 20}
+  ]
+}

@@ -1,0 +1,2 @@
+{"schema_version":2,"paradigm":"grouped","model_type":"seir","horizon_days":60,"step_days":0.5,"beta":0.4,"sigma":0.2,"gamma":0.1,"gamma_q":0.15,
+"groups":[{"id":"a","size":1000,"init_s":900,"init_i":10}],"contacts":[[0.8]]}

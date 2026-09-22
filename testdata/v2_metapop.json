@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "paradigm": "metapop",
+  "model_type": "sir",
+  "horizon_days": 40,
+  "step_days": 1,
+  "seed": 7,
+  "beta": 0.4,
+  "sigma": 0,
+  "gamma": 0.1,
+  "gamma_q": 0.1,
+  "groups": [
+    {"id": "city",  "size": 10000, "init_s": 9980, "init_i": 20},
+    {"id": "town",  "size": 3000,  "init_s": 3000},
+    {"id": "rural", "size": 1000,  "init_s": 1000}
+  ],
+  "migration": [
+    [0,    0.01, 0.005],
+    [0.02, 0,    0.01],
+    [0.005, 0.01, 0]
+  ]
+}

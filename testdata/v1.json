@@ -1,0 +1,1 @@
+{"version":"1","days":30,"pop_size":10000,"init_i":20,"r0":2.5,"recovery":0.1,"lockdown_start":10,"lockdown_end":20,"lockdown_strength":0.6}
