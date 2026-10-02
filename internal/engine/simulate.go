@@ -18,8 +18,8 @@ const (
 //
 // 时间轴：t_k = k*step，k=0..N（N=round(horizon/step)）。干预为半开区间，
 // 在 t_k 生效当且仅当 start<=t_k<end。每步先做仓室动力学（固定步长欧拉），
-// 再按迁移矩阵重排 S/E/I/R；Q（隔离中）不参与迁移。全程无随机数，
-// 重复运行与任何并行度下结果逐位一致。
+// 再按迁移矩阵重排 S/E/I/R；Q（隔离中）与 V（已免疫）不参与迁移。
+// 全程无随机数，重复运行与任何并行度下结果逐位一致。
 func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, error) {
 	if err := validate.Scenario(sc); err != nil {
 		return nil, err
@@ -38,7 +38,8 @@ func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, e
 
 	st := &model.State{
 		S: make([]float64, g), E: make([]float64, g),
-		I: make([]float64, g), R: make([]float64, g), Q: make([]float64, g),
+		I: make([]float64, g), R: make([]float64, g),
+		Q: make([]float64, g), V: make([]float64, g),
 	}
 	groupIDs := make([]string, g)
 	for i, grp := range sc.Groups {
@@ -55,7 +56,7 @@ func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, e
 		}
 		return v
 	}
-	tr.S, tr.E, tr.I, tr.R, tr.Q = alloc(), alloc(), alloc(), alloc(), alloc()
+	tr.S, tr.E, tr.I, tr.R, tr.Q, tr.V = alloc(), alloc(), alloc(), alloc(), alloc(), alloc()
 
 	record := func(t float64) {
 		tr.Times = append(tr.Times, t)
@@ -65,14 +66,19 @@ func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, e
 			tr.I[i] = append(tr.I[i], st.I[i])
 			tr.R[i] = append(tr.R[i], st.R[i])
 			tr.Q[i] = append(tr.Q[i], st.Q[i])
+			tr.V[i] = append(tr.V[i], st.V[i])
 		}
 	}
 	record(0)
 
+	// 疫苗额度台账：每个额度池的结转余额（仅 accumulate 池非零），
+	// 随推演推进确定性地更新。
+	ledger := newVaccineLedger(sc)
+
 	for k := 0; k < n; k++ {
 		t := float64(k) * dt
 		active := sched.ActiveAt(t)
-		step(sc, st, active, dt, t, &tr.CapacityEvents)
+		step(sc, st, active, dt, t, ledger, &tr.CapacityEvents, &tr.VaccinationEvents)
 		if sc.MigrationMatrix != nil {
 			applyMigration(sc.MigrationMatrix, st, dt)
 		}
@@ -81,8 +87,10 @@ func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, e
 	return tr, nil
 }
 
-// step 推进一个欧拉步：接触缩减 -> 感染力 -> SEIR 转化 -> 隔离（含容量）。
-func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, t float64, events *[]model.CapacityEvent) {
+// step 推进一个欧拉步：接触缩减 -> 感染力 -> SEIR 转化 -> 隔离（含容量）
+// -> 免疫接种（含额度配给）。V（免疫）与 Q（隔离中）一样不参与传播与迁移。
+func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, t float64,
+	ledger *vaccineLedger, events *[]model.CapacityEvent, vaxEvents *[]model.VaccinationEvent) {
 	g := len(sc.Groups)
 
 	// 1) 有效接触矩阵：contact_reduction 对目标分组的接触行乘 (1-strength*compliance)。
@@ -101,7 +109,8 @@ func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, 
 		}
 	}
 
-	// 2) 感染力。被隔离者不在传播环内，流行率分母/分子都只计活动人口。
+	// 2) 感染力。被隔离者(Q)与已免疫者(V)都不在传播环内，
+	// 流行率分母/分子都只计活动人口 S+E+I+R。
 	lambda := make([]float64, g)
 	for a := 0; a < g; a++ {
 		l := 0.0
@@ -120,25 +129,29 @@ func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, 
 	dI := make([]float64, g)
 	dR := make([]float64, g)
 	dQ := make([]float64, g)
+	dV := make([]float64, g)
+	// newInf 记录本步各分组的新感染流量，供接种需求扣除（保证 S 不为负）。
+	newInf := make([]float64, g)
 
 	// 3) SEIR/SIR 转化（守恒、非负）。
 	for a := 0; a < g; a++ {
-		newInf := st.S[a] * lambda[a] * dt
-		newInf = math.Min(newInf, st.S[a]) // 单步感染不超过易感存量
-		dS[a] -= newInf
+		ni := st.S[a] * lambda[a] * dt
+		ni = math.Min(ni, st.S[a]) // 单步感染不超过易感存量
+		newInf[a] = ni
+		dS[a] -= ni
 		switch sc.Paradigm {
 		case model.ParadigmSEIR:
 			prog := st.E[a] * sc.Parameters.Sigma * dt
-			prog = math.Min(prog, st.E[a]+newInf)
+			prog = math.Min(prog, st.E[a]+ni)
 			rec := st.I[a] * sc.Parameters.Gamma * dt
 			rec = math.Min(rec, st.I[a]+prog)
-			dE[a] += newInf - prog
+			dE[a] += ni - prog
 			dI[a] += prog - rec
 			dR[a] += rec
 		case model.ParadigmSIR:
 			rec := st.I[a] * sc.Parameters.Gamma * dt
-			rec = math.Min(rec, st.I[a]+newInf)
-			dI[a] += newInf - rec
+			rec = math.Min(rec, st.I[a]+ni)
+			dI[a] += ni - rec
 			dR[a] += rec
 		}
 		// Q 仓中的隔离者以相同恢复速率移出隔离并进入 R。
@@ -155,12 +168,21 @@ func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, 
 		dQ[a] += admit[a]
 	}
 
+	// 5) 免疫接种：S->V，受额度池每日额度约束；需求扣除本步新感染后
+	// 的剩余易感，保证 S 不为负。
+	vax := ledger.allocate(sc, st, newInf, active, dt, t, vaxEvents)
+	for a := 0; a < g; a++ {
+		dS[a] -= vax[a]
+		dV[a] += vax[a]
+	}
+
 	for a := 0; a < g; a++ {
 		st.S[a] = enforceNonNeg(st.S[a] + dS[a])
 		st.E[a] = enforceNonNeg(st.E[a] + dE[a])
 		st.I[a] = enforceNonNeg(st.I[a] + dI[a])
 		st.R[a] = enforceNonNeg(st.R[a] + dR[a])
 		st.Q[a] = enforceNonNeg(st.Q[a] + dQ[a])
+		st.V[a] = enforceNonNeg(st.V[a] + dV[a])
 	}
 }
 
@@ -225,7 +247,7 @@ func isolationAdmission(sc *model.Scenario, st *model.State, active []model.Inte
 	return admit
 }
 
-// applyMigration 按迁移矩阵对 S/E/I/R 做闭流重排（Q 不参与迁移）。
+// applyMigration 按迁移矩阵对 S/E/I/R 做闭流重排（Q 与 V 不参与迁移）。
 //
 // 口径约定（确定性、任意步长稳定）：M[i][j]（i≠j）为每日从 i 迁移到 j 的
 // 人口比例；行和闭合约束（Σ_j M[i][j]=1）使 M[i][i] 等价于“不外迁比例”。

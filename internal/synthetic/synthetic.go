@@ -41,7 +41,7 @@ func GenerateObserved(sc *model.Scenario, opts GenerateOptions) (model.Observati
 			"sir 口径下不存在 E 仓，不能生成 E 仓观测")
 	}
 	switch opts.Compartment {
-	case model.CompS, model.CompE, model.CompI, model.CompR, model.CompQ:
+	case model.CompS, model.CompE, model.CompI, model.CompR, model.CompQ, model.CompV:
 	default:
 		return model.ObservationSeries{}, model.NewError(model.ErrObservationMismatch,
 			"未知观测仓室 %q", opts.Compartment)
@@ -90,6 +90,8 @@ func compartmentValue(tr *model.Trajectory, g, k int, c model.Compartment) float
 		return tr.R[g][k]
 	case model.CompQ:
 		return tr.Q[g][k]
+	case model.CompV:
+		return tr.V[g][k]
 	default:
 		return math.NaN()
 	}

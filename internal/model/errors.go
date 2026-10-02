@@ -19,6 +19,12 @@ const (
 	ErrEstimateNotConverged ErrorKind = "estimate_not_converged"
 	ErrFeasibleDomain       ErrorKind = "estimate_outside_feasible_domain"
 	ErrCheckpoint           ErrorKind = "checkpoint_invalid"
+	// ErrVaccinationInvalid 接种安排本身非法（速率/依从度/携带其他类型字段等）。
+	ErrVaccinationInvalid ErrorKind = "vaccination_invalid"
+	// ErrVaccineQuotaInvalid 疫苗额度池定义非法（额度为负/非有限、时间轴非法、id 重复等）。
+	ErrVaccineQuotaInvalid ErrorKind = "vaccine_quota_invalid"
+	// ErrVaccineQuotaReference 接种安排引用了不存在的额度池。
+	ErrVaccineQuotaReference ErrorKind = "vaccine_quota_reference_invalid"
 )
 
 // ValidationError 携带归类原因与可读细节，便于调用方按 Kind 区分处理。

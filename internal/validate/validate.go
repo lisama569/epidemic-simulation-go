@@ -51,10 +51,47 @@ func Scenario(sc *model.Scenario) error {
 	if err := validateMigration(sc, g); err != nil {
 		return err
 	}
-	if err := validateInterventions(sc, ids); err != nil {
+	quotaIDs, err := validateVaccineQuotas(sc)
+	if err != nil {
+		return err
+	}
+	if err := validateInterventions(sc, ids, quotaIDs); err != nil {
 		return err
 	}
 	return nil
+}
+
+// validateVaccineQuotas 校验疫苗额度池：id 非空唯一、每日额度非负有限
+// （0 是合法的零额度，表示该池在生效期内不提供疫苗）、生效区间对齐网格
+// 且不越界。任何矛盾都明确拒绝，不静默套默认值。
+func validateVaccineQuotas(sc *model.Scenario) (map[string]bool, error) {
+	ids := make(map[string]bool, len(sc.VaccineQuotas))
+	for i, q := range sc.VaccineQuotas {
+		at := func(format string, args ...any) error {
+			return model.NewError(model.ErrVaccineQuotaInvalid,
+				"vaccineQuotas[%d]: %s", i, fmt.Sprintf(format, args...))
+		}
+		if q.ID == "" {
+			return nil, at("额度池缺少 id")
+		}
+		if ids[q.ID] {
+			return nil, at("额度池 id %q 重复", q.ID)
+		}
+		ids[q.ID] = true
+		if !finiteNonNeg(q.DailyLimit) {
+			return nil, at("dailyLimit=%v 必须为非负有限值", q.DailyLimit)
+		}
+		if !(q.StartDays >= 0 && q.EndDays > q.StartDays && q.EndDays <= sc.HorizonDays+gridTol) {
+			return nil, model.NewError(model.ErrTimelineReversed,
+				"vaccineQuotas[%d]: 区间 [%.6f,%.6f) 不满足 0<=start<end<=horizon(%.6f)",
+				i, q.StartDays, q.EndDays, sc.HorizonDays)
+		}
+		if !aligned(q.StartDays, sc.StepDays) || !aligned(q.EndDays, sc.StepDays) {
+			return nil, model.NewError(model.ErrTimelineReversed,
+				"vaccineQuotas[%d]: 区间端点必须落在步长 %.6f 的整数倍网格上", i, sc.StepDays)
+		}
+	}
+	return ids, nil
 }
 
 func finiteNonNeg(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 }
@@ -180,9 +217,9 @@ func validateMigration(sc *model.Scenario, g int) error {
 	return nil
 }
 
-func validateInterventions(sc *model.Scenario, ids map[string]int) error {
+func validateInterventions(sc *model.Scenario, ids map[string]int, quotaIDs map[string]bool) error {
 	for i, iv := range sc.Interventions {
-		if err := validateOneIntervention(sc, ids, i, iv); err != nil {
+		if err := validateOneIntervention(sc, ids, quotaIDs, i, iv); err != nil {
 			return err
 		}
 	}
@@ -206,13 +243,17 @@ func validateInterventions(sc *model.Scenario, ids map[string]int) error {
 	return nil
 }
 
-func validateOneIntervention(sc *model.Scenario, ids map[string]int, idx int, iv model.Intervention) error {
+func validateOneIntervention(sc *model.Scenario, ids map[string]int, quotaIDs map[string]bool, idx int, iv model.Intervention) error {
 	at := func(format string, args ...any) error {
 		return model.NewError(model.ErrInterventionInvalid,
 			"interventions[%d]: %s", idx, fmt.Sprintf(format, args...))
 	}
+	atVax := func(format string, args ...any) error {
+		return model.NewError(model.ErrVaccinationInvalid,
+			"interventions[%d]: %s", idx, fmt.Sprintf(format, args...))
+	}
 	switch iv.Type {
-	case model.InterventionContactReduction, model.InterventionIsolation:
+	case model.InterventionContactReduction, model.InterventionIsolation, model.InterventionVaccination:
 	default:
 		return at("未知干预类型 %q", iv.Type)
 	}
@@ -250,6 +291,9 @@ func validateOneIntervention(sc *model.Scenario, ids map[string]int, idx int, iv
 		if iv.RatePerDay != 0 || iv.Capacity != nil {
 			return at("contact_reduction 不得设置 ratePerDay/capacity")
 		}
+		if iv.QuotaID != "" || iv.Priority != 0 {
+			return at("contact_reduction 不得设置 quotaId/priority")
+		}
 	case model.InterventionIsolation:
 		if !finitePos(iv.RatePerDay) {
 			return at("isolation 的 ratePerDay=%v 必须为正有限值", iv.RatePerDay)
@@ -259,6 +303,35 @@ func validateOneIntervention(sc *model.Scenario, ids map[string]int, idx int, iv
 		}
 		if iv.Capacity != nil && !finiteNonNeg(*iv.Capacity) {
 			return at("capacity=%v 必须为非负有限值，或省略表示无界", *iv.Capacity)
+		}
+		if iv.QuotaID != "" || iv.Priority != 0 {
+			return at("isolation 不得设置 quotaId/priority")
+		}
+	case model.InterventionVaccination:
+		if !finitePos(iv.RatePerDay) {
+			return atVax("vaccination 的 ratePerDay=%v 必须为正有限值", iv.RatePerDay)
+		}
+		if iv.Strength != 0 || iv.Capacity != nil {
+			return atVax("vaccination 不得设置 strength/capacity")
+		}
+		if iv.QuotaID == "" {
+			return model.NewError(model.ErrVaccineQuotaReference,
+				"interventions[%d]: vaccination 必须声明 quotaId 引用一个疫苗额度池", idx)
+		}
+		if !quotaIDs[iv.QuotaID] {
+			return model.NewError(model.ErrVaccineQuotaReference,
+				"interventions[%d]: 引用了不存在的疫苗额度池 %q", idx, iv.QuotaID)
+		}
+		// 接种区间必须落在所引用额度池的生效区间内，否则存在无额度支撑的
+		// 接种安排（会被静默零分配），属于口径矛盾，明确拒绝。
+		for _, q := range sc.VaccineQuotas {
+			if q.ID != iv.QuotaID {
+				continue
+			}
+			if iv.StartDays < q.StartDays-gridTol || iv.EndDays > q.EndDays+gridTol {
+				return atVax("接种区间 [%.6f,%.6f) 超出额度池 %q 的生效区间 [%.6f,%.6f)",
+					iv.StartDays, iv.EndDays, q.ID, q.StartDays, q.EndDays)
+			}
 		}
 	}
 	return nil
