@@ -1,0 +1,33 @@
+{
+  "configVersion": 2,
+  "paradigm": "seir",
+  "parameters": { "beta": 0.35, "gamma": 0.1, "sigma": 0.2 },
+  "horizonDays": 60,
+  "stepDays": 0.5,
+  "randomSeed": 20261003,
+  "groups": [
+    { "id": "city", "name": "城区", "s0": 990, "i0": 10 },
+    { "id": "town", "name": "乡镇", "s0": 600 }
+  ],
+  "contactMatrix": [[2.4, 0.3], [0.3, 2.0]],
+  "migrationMatrix": [[0.95, 0.05], [0.08, 0.92]],
+  "vaccineQuotas": [
+    { "id": "national", "dosesPerDay": 120 },
+    { "id": "reserve", "dosesPerDay": 30, "accumulate": true }
+  ],
+  "interventions": [
+    { "type": "contact_reduction", "groups": ["city", "town"],
+      "startDays": 10, "endDays": 30, "strength": 0.65, "compliance": 0.85 },
+    { "type": "isolation", "groups": ["city", "town"],
+      "startDays": 12, "endDays": 40, "ratePerDay": 0.4, "compliance": 0.9, "capacity": 40 },
+    { "type": "vaccination", "groups": ["city"],
+      "startDays": 5, "endDays": 45, "dosesPerDay": 90, "compliance": 0.95,
+      "quotaId": "national", "priority": 1 },
+    { "type": "vaccination", "groups": ["town"],
+      "startDays": 5, "endDays": 45, "dosesPerDay": 60, "compliance": 1.0,
+      "quotaId": "national", "priority": 2 },
+    { "type": "vaccination", "groups": ["town"],
+      "startDays": 45, "endDays": 55, "dosesPerDay": 40, "compliance": 1.0,
+      "quotaId": "reserve", "priority": 1 }
+  ]
+}

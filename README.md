@@ -22,17 +22,20 @@
 
 ### 2.1 仓室
 
-每个分组在任一时刻持有五个仓室（人数，非负、有限）：
+每个分组在任一时刻持有六个仓室（人数，非负、有限）：
 
 - `S` 易感；`E` 潜伏（感染但尚不具传播性）；`I` 感染且可传播；
-- `R` 移除（康复/死亡，本模型不区分）；`Q` 被隔离（已从传播环移除）。
+- `R` 移除（康复/死亡，本模型不区分）；`Q` 被隔离（已从传播环移除）；
+- `V` **免疫接种成功**：独立可观测的免疫状态。V 仓个体既不会被感染，
+  也不参与传播（不计入感染力分母/分子），但仍计入总人口，随其分组参与迁移。
 
 支持两种建模口径：
 
 - `sir`：无 E 仓，`E0` 必须为 0、参数 `sigma` 必须为 0，否则拒绝；
 - `seir`：`sigma`（E→I 每日速率）必须为正。
 
-两种口径由同一推演框架表述，差异仅在状态机是否包含 E 仓。
+两种口径由同一推演框架表述，差异仅在状态机是否包含 E 仓。接种在两种口径下
+语义一致（成功者从 `S` 直接移入 `V`）。
 
 ### 2.2 群体结构与接触关系
 
@@ -57,8 +60,10 @@
 `f_a` 是接触缩减因子（见 §3）；分母只计活动人口（Q 在隔离中不传播）。
 
 - 每步顺序：SEIR/SIR 转化（固定步长欧拉，单步流量裁剪到不超过存量）
-  → 隔离准入（容量配给）→ 迁移重排。Q 不参与迁移，隔离者以相同 `gamma`
-  进入 R。每一步对全部人口严格守恒，所有仓室非负。
+  → 隔离准入（容量配给）→ **接种（额度配给，成功者 S→V）** → 迁移重排。
+  Q 不参与迁移，V 参与迁移（接种者随分组流动，到新分组后仍不感染、不传播）；
+  隔离者以相同 `gamma` 进入 R。接种需求在感染消耗**之后**按易感存量封顶，
+  因此感染与接种不会叠加超扣 S。每一步对全部人口严格守恒，所有仓室非负。
 - 迁移在任意 `stepDays` 下采用稳定子步进欧拉：子步长 h 满足
   `h·max_i Σ_{j≠i} M[i][j] ≤ 1`，单子步转移行和恒为 1，
   因此即使日外迁比例很高、dt>1 天，也不会出现负数或人口泄漏。
@@ -91,6 +96,67 @@
   需求超过可用容量时按可用量配给，绝不出现 Q 超容量或任何负仓室。
 - 每次配给都产生一条 `CapacityEvent`，记录**时间点、分组、需求、可用量、
   实际准入量与原因**（`isolation_capacity_exhausted`），可直接定位。
+
+### 3.3 免疫接种（vaccination）
+
+接种是与接触缩减、隔离并列的第三种干预，写在同一情景的 `interventions`
+列表里、在同一推演中同时生效（配置示例见
+`testdata/scenario-v2-vaccine.json`）。
+
+情景级先声明一个或多个**每日疫苗额度池**，接种安排按 `quotaId` 引用：
+
+```json
+"vaccineQuotas": [
+  { "id": "national", "dosesPerDay": 120 },
+  { "id": "reserve",  "dosesPerDay": 30, "accumulate": true }
+]
+```
+
+接种干预字段：
+
+| 字段 | 含义 |
+|---|---|
+| `groups` | 本安排的目标分组；同一分组同一时段只允许一个接种安排 |
+| `startDays`/`endDays` | 半开区间，**端点必须落在自然日边界（整数天）** |
+| `dosesPerDay` | 每天计划给 `groups` 中**每个分组**接种的人数（速率语义，按步长折算） |
+| `compliance` | 依从度 (0,1]，实际接种速率 = `dosesPerDay·compliance` |
+| `quotaId` | 引用 `vaccineQuotas` 中已声明的额度池（必填，引用不存在即拒绝） |
+| `priority` | 额度不足时的优先级，**数值越小越优先** |
+
+**额度与结转规则**
+
+- 每个额度池在每个自然日 0 点补充 `dosesPerDay` 人份，并按 `stepDays`
+  折算到每个积分步；同一天内多个积分步共享当日额度。
+- `accumulate` 缺省为 `false`：**当天用不完的额度不结转到下一天**，
+  跨自然日清零；显式 `"accumulate": true` 时未用完额度滚入下一天。
+- 同一时段的多个接种安排、多个分组可共用同一额度池。
+- 存在接种安排时强制 `1/stepDays` 为整数（每个自然日含整数个积分步），
+  否则归类 `vaccination_timeline_invalid`，不静默默认。
+
+**额度不足时的分配（稳定、可解释）**
+
+所有“安排 × 分组”请求按唯一全序排序后依次满足：
+
+```
+priority 升序 → 干预在情景中的下标升序 → 分组下标升序
+```
+
+因此优先级并列时结果仍完全确定（先声明者、排在前面的分组先得）。任何一步
+的总接种量绝不超过该池当时剩余额度；每处“计划接种 > 实际接种”都记录一条
+`VaccinationEvent`，可定位到**哪一天、哪个分组、引用的额度池与优先级、
+原计划人数、实际接种人数、少接种量、原因**。原因两类，明确区分：
+
+- `vaccine_quota_exhausted`：当日共享额度不足（额度是瓶颈）；
+- `eligible_susceptible_exhausted`：额度足够，但目标分组当时的易感者不足。
+
+**与其它干预的关系**
+
+- 接种与接触缩减、隔离允许在同一时段同时生效；三类干预各自动作于不同仓室，
+  状态不会被算乱（由共存单测验证六仓室非负、总人口守恒、Q 不超容量）。
+- 两个接种安排在同一分组、同一时段重叠属于计划自相矛盾，归类
+  `vaccination_conflict`（区别于普通干预的 `intervention_interval_overlap`）；
+  不同分组的接种安排同期重叠是允许的（靠优先级共享额度）。
+- 接种成功即进入 V：不感染、不传播、不被隔离。
 
 ## 4. 确定性与并行复现
 
@@ -159,7 +225,11 @@
 | `timeline_reversed` | 步长非正、区间不整除网格、区间倒退/越界/不对齐 |
 | `intervention_interval_overlap` | 同类型同目标分组区间重叠 |
 | `parameter_out_of_range` | beta/gamma/sigma 非法、口径与 sigma 矛盾、可行域非法等 |
-| `intervention_invalid` | 干预类型/依从度/强度/速率/容量非法 |
+| `intervention_invalid` | 干预类型/依从度/强度/速率/容量非法；非接种干预携带接种专属字段 |
+| `vaccination_invalid` | 接种安排字段非法（缺 quotaId、dosesPerDay 非正、误带 capacity 等） |
+| `vaccine_quota_invalid` | 额度池负/非有限、id 重复或为空、接种安排引用了不存在的额度池、有池无安排 |
+| `vaccination_timeline_invalid` | 接种端点未对齐自然日，或 `1/stepDays` 非整数 |
+| `vaccination_conflict` | 同一分组同一时段存在互相矛盾的多个接种安排 |
 | `group_reference_invalid` | 干预或观测引用不存在的分组 |
 | `observation_paradigm_mismatch` | 观测与模型口径不兼容 |
 | `estimate_not_converged` | 估计未达收敛（结果中如实报告） |
@@ -187,6 +257,17 @@ v1→v2：旧干预缺少 `adherence` 时按确定规则取 1.0（旧格式中�
 归一后仍走完整 v2 校验。参考文件：`testdata/scenario-v1-legacy.json`、
 `testdata/scenario-v2.json`。
 
+### 7.1 接种能力与旧配置的兼容范围
+
+- **v1 旧配置没有接种概念**：`vaccineQuotas` 与接种专属字段（`dosesPerDay`、
+  `quotaId`、`priority`）归一后一律为空/零值，v1 文件按原归一规则照常加载、
+  照常推演，不会因为新增了接种能力而报错；轨迹中的 `V` 仓恒为 0
+  （由 `TestV1LegacyUnaffectedByVaccine` 锁定）。
+- 接种是 **v2 专属**能力，不会替旧配置“脑补”任何疫苗计划；
+  v2 严格解析下，`vaccineQuotas` 与接种干预内的任何未知/拼错字段同样被拒绝
+  （`config_syntax_invalid`）。
+- 未使用接种的 v2 配置行为完全不变：`vaccineQuotas` 可整体省略。
+
 ## 8. 本地验证方法
 
 要求 Go 1.25+（在 1.26 下验证）。无需网络、无需外部数据。
@@ -198,6 +279,8 @@ go test -race -count=2 ./...
 # 单个情景推演（v1 旧配置会被自动归一）
 go run ./cmd/epidemic run -config testdata/scenario-v2.json
 go run ./cmd/epidemic run -config testdata/scenario-v1-legacy.json
+# 含免疫接种的情景（输出 finalVaccinated 与 vaccinationEvents）
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccine.json
 
 # 合成观测 + 参数估计（收敛判定/区间/并行）
 go run ./cmd/epidemic estimate -config testdata/scenario-v2.json -parallelism 4
@@ -215,6 +298,24 @@ go run ./cmd/epidemic demo
 测试日志会打印关键输入、随机种子与判定依据，例如：
 
 - 容量测试：`I0`、隔离速率、依从度、容量、首次容量事件时间/分组/需求；
+- 接种测试：`randomSeed`、额度池日额度/是否累积、各安排剂量与优先级、
+  每步额度与全序决胜依据、首条少接种事件的天/分组/需求/实种/原因；
+- 接种检查点：中断步数与时刻、恢复后六仓室逐点相等、接种/容量事件逐条相等；
 - 合成数据：`seed`、`noiseSD`、同/异种子一致性结论；
 - 估计：`betaHat`、区间、末轮位移、阈值、连续稳定轮数与收敛原因；
 - 迁移：各 `stepDays` 下的守恒结论。
+
+### 8.1 接种中途检查点恢复（程序化接口）
+
+引擎提供推演级中途检查点，用于验证“接种进行到一半中断后续算”与不间断运行
+逐位一致（`internal/engine/sim_checkpoint.go`）：
+
+- `RunUntil(sc, sched, stopAfterSteps)` 在任一积分步边界产出检查点
+  （已完成步数、六仓室状态、额度池剩余额度与所在自然日、截至该点的全部
+  容量/接种事件、情景 SHA-256 摘要）；
+- `SaveSimCheckpoint(dir, cp)` / `LoadSimCheckpoint(dir)` 原子落盘/读取
+  `<dir>/sim-checkpoint.json`；
+- `ResumeAndRun(sc, sched, cp)` 校验摘要一致后从同一状态、同一额度余量
+  续算，拼出完整轨迹。情景被改动（含改任何接种参数）会因摘要不符被拒绝。
+- 覆盖测试 `TestVaccinationCheckpointResume` 刻意把中断点选在额度争抢期的
+  非整日（t=12.5），断言恢复轨迹与事件流同不间断运行**逐位相等**。

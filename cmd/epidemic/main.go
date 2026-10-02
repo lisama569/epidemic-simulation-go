@@ -86,12 +86,15 @@ func loadScenario(path string) (*model.Scenario, error) {
 
 // runResult 是 run 子命令的结构化输出。
 type runResult struct {
-	Steps          int                   `json:"steps"`
-	GroupIDs       []string              `json:"groupIds"`
-	PeakI          map[string]float64    `json:"peakInfected"`
-	FinalR         map[string]float64    `json:"finalRemoved"`
-	CapacityEvents []model.CapacityEvent `json:"capacityEvents"`
-	CapacityCount  int                   `json:"capacityEventCount"`
+	Steps             int                      `json:"steps"`
+	GroupIDs          []string                 `json:"groupIds"`
+	PeakI             map[string]float64       `json:"peakInfected"`
+	FinalR            map[string]float64       `json:"finalRemoved"`
+	FinalV            map[string]float64       `json:"finalVaccinated"`
+	CapacityEvents    []model.CapacityEvent    `json:"capacityEvents"`
+	CapacityCount     int                      `json:"capacityEventCount"`
+	VaccinationEvents []model.VaccinationEvent `json:"vaccinationEvents"`
+	VaccinationCount  int                      `json:"vaccinationEventCount"`
 }
 
 func runCmd(args []string) error {
@@ -116,8 +119,9 @@ func runCmd(args []string) error {
 		return err
 	}
 	res := runResult{Steps: len(tr.Times) - 1, GroupIDs: tr.GroupIDs,
-		PeakI: map[string]float64{}, FinalR: map[string]float64{},
-		CapacityEvents: tr.CapacityEvents, CapacityCount: len(tr.CapacityEvents)}
+		PeakI: map[string]float64{}, FinalR: map[string]float64{}, FinalV: map[string]float64{},
+		CapacityEvents: tr.CapacityEvents, CapacityCount: len(tr.CapacityEvents),
+		VaccinationEvents: tr.VaccinationEvents, VaccinationCount: len(tr.VaccinationEvents)}
 	for g, gid := range tr.GroupIDs {
 		peak := 0.0
 		for _, v := range tr.I[g] {
@@ -127,6 +131,7 @@ func runCmd(args []string) error {
 		}
 		res.PeakI[gid] = peak
 		res.FinalR[gid] = tr.R[g][len(tr.R[g])-1]
+		res.FinalV[gid] = tr.V[g][len(tr.V[g])-1]
 	}
 	return printJSON(res)
 }

@@ -19,6 +19,14 @@ const (
 	ErrEstimateNotConverged ErrorKind = "estimate_not_converged"
 	ErrFeasibleDomain       ErrorKind = "estimate_outside_feasible_domain"
 	ErrCheckpoint           ErrorKind = "checkpoint_invalid"
+	// ErrVaccinationInvalid 接种安排本身非法（字段取值、缺失等）。
+	ErrVaccinationInvalid ErrorKind = "vaccination_invalid"
+	// ErrVaccineQuotaInvalid 疫苗额度池非法（负/非有限、id 重复等）或引用不存在。
+	ErrVaccineQuotaInvalid ErrorKind = "vaccine_quota_invalid"
+	// ErrVaccinationTimeline 接种时间轴问题：未按整日对齐、倒退、越界等。
+	ErrVaccinationTimeline ErrorKind = "vaccination_timeline_invalid"
+	// ErrVaccinationConflict 同一分组同一时段存在互相矛盾的多个接种安排。
+	ErrVaccinationConflict ErrorKind = "vaccination_conflict"
 )
 
 // ValidationError 携带归类原因与可读细节，便于调用方按 Kind 区分处理。

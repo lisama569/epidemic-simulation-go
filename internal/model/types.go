@@ -1,7 +1,8 @@
 // Package model 定义传染病推演引擎的核心领域类型与状态约定。
 //
-// 状态约定：每个分组(group)在任一时刻持有 S/E/I/R/Q 五个仓室：
-//   - S 易感, E 潜伏(仅 seir 口径), I 感染且可传播, R 移除, Q 被隔离(已从传播环移除)
+// 状态约定：每个分组(group)在任一时刻持有 S/E/I/R/Q/V 六个仓室：
+//   - S 易感, E 潜伏(仅 seir 口径), I 感染且可传播, R 移除, Q 被隔离(已从传播环移除),
+//     V 免疫接种成功（既不会被感染也不参与传播，但仍计入总人口）
 //
 // sir 口径下 E 恒为 0。所有仓室人数必须非负、有限。
 package model
@@ -25,6 +26,8 @@ const (
 	CompI Compartment = "I"
 	CompR Compartment = "R"
 	CompQ Compartment = "Q"
+	// CompV 免疫接种成功仓室：独立可观测，不感染、不传播。
+	CompV Compartment = "V"
 )
 
 // Group 描述一个人口分组及其初始状态。
@@ -53,6 +56,9 @@ const (
 	InterventionContactReduction InterventionType = "contact_reduction"
 	// InterventionIsolation 隔离：以固定速率将 I 仓个体移入 Q 仓，受容量约束。
 	InterventionIsolation InterventionType = "isolation"
+	// InterventionVaccination 免疫接种：在指定时段给目标分组每日接种，
+	// 成功者从 S 仓移入 V 仓；接种量受共享的每日疫苗额度约束。
+	InterventionVaccination InterventionType = "vaccination"
 )
 
 // Intervention 描述一项分阶段干预。
@@ -69,6 +75,25 @@ type Intervention struct {
 	// Capacity 为隔离容量上限（同时在 Q 仓人数）。nil 表示容量无界；
 	// 该语义是显式约定，零值不会被当作无界。
 	Capacity *float64 `json:"capacity,omitempty"`
+
+	// 以下字段仅 vaccination 使用：
+	// DosesPerDay 为该安排每日计划给 Groups 中每个分组接种的人数（速率语义，
+	// 按步长折算到每个积分步）；
+	// QuotaID 引用 Scenario.VaccineQuotas 中的一个共享额度池；
+	// Priority 为额度不足时的分配优先级（数值越小越优先，并列时按情景中的
+	// 稳定次序分配）。
+	DosesPerDay float64 `json:"dosesPerDay,omitempty"`
+	QuotaID     string  `json:"quotaId,omitempty"`
+	Priority    int     `json:"priority,omitempty"`
+}
+
+// VaccineQuota 描述一个在多个接种安排之间共享的每日疫苗额度池。
+// DosesPerDay 为每个自然日 0 点补充的额度（按步长折算到积分步）；
+// Accumulate=true 时当日未用完的额度结转到下一天，否则当日清零。
+type VaccineQuota struct {
+	ID          string  `json:"id"`
+	DosesPerDay float64 `json:"dosesPerDay"`
+	Accumulate  bool    `json:"accumulate,omitempty"`
 }
 
 // Scenario 是一次推演的完整输入。
@@ -87,13 +112,16 @@ type Scenario struct {
 	// nil 表示无迁移。
 	MigrationMatrix [][]float64    `json:"migrationMatrix,omitempty"`
 	Interventions   []Intervention `json:"interventions,omitempty"`
+	// VaccineQuotas 声明可被 vaccination 干预按 quotaId 共享引用的每日额度池。
+	// 无接种干预时必须为空；旧版本配置归一后亦为空。
+	VaccineQuotas []VaccineQuota `json:"vaccineQuotas,omitempty"`
 	// RandomSeed 仅用于合成观测加噪等随机环节；确定性推演本身不使用随机数。
 	RandomSeed int64 `json:"randomSeed,omitempty"`
 }
 
 // State 是某一时刻全部分组的仓室状态，按分组下标索引。
 type State struct {
-	S, E, I, R, Q []float64
+	S, E, I, R, Q, V []float64
 }
 
 // CapacityEvent 记录一次容量受限事件，可定位时间、分组与原因。
@@ -106,13 +134,39 @@ type CapacityEvent struct {
 	Reason    string  `json:"reason"`
 }
 
+// 接种额度受限/少接种事件的原因取值。
+const (
+	// VaccReasonQuotaExhausted 当日共享额度不足导致少接种。
+	VaccReasonQuotaExhausted = "vaccine_quota_exhausted"
+	// VaccReasonEligibleExhausted 目标分组可接种（S 仓）人数不足导致少接种。
+	VaccReasonEligibleExhausted = "eligible_susceptible_exhausted"
+)
+
+// VaccinationEvent 记录某一天某接种安排在某分组上的接种分配明细。
+// 任何“计划接种 > 实际接种”的情形都会记录一条，Reason 区分是额度不足
+// 还是可接种人口不足；Demand 为折算到该步的原计划人数，Allocated 为
+// 实际接种人数，QuotaID/Priority 记录当时的分配依据。
+type VaccinationEvent struct {
+	TimeDays       float64 `json:"timeDays"`
+	Day            int     `json:"day"`
+	GroupID        string  `json:"groupId"`
+	QuotaID        string  `json:"quotaId"`
+	Priority       int     `json:"priority"`
+	InterventionID int     `json:"interventionIndex"`
+	Demand         float64 `json:"demand"`
+	Allocated      float64 `json:"allocated"`
+	Shortfall      float64 `json:"shortfall"`
+	Reason         string  `json:"reason"`
+}
+
 // Trajectory 是一次推演的完整离散轨迹。
-// S/E/I/R/Q[g][k] 为分组 g 在第 k 个时间点的仓室人数。
+// S/E/I/R/Q/V[g][k] 为分组 g 在第 k 个时间点的仓室人数。
 type Trajectory struct {
-	GroupIDs       []string        `json:"groupIds"`
-	Times          []float64       `json:"times"`
-	S, E, I, R, Q  [][]float64     `json:"-"`
-	CapacityEvents []CapacityEvent `json:"capacityEvents,omitempty"`
+	GroupIDs          []string           `json:"groupIds"`
+	Times             []float64          `json:"times"`
+	S, E, I, R, Q, V  [][]float64        `json:"-"`
+	CapacityEvents    []CapacityEvent    `json:"capacityEvents,omitempty"`
+	VaccinationEvents []VaccinationEvent `json:"vaccinationEvents,omitempty"`
 }
 
 // Observation 是一条观测：某时刻某分组某仓室的观测人数。

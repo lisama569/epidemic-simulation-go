@@ -13,9 +13,10 @@ go vet ./...
 echo "== go test -race -count=1 =="
 go test -race -count=1 ./...
 
-echo "== CLI: run (v2 / v1 归一) =="
+echo "== CLI: run (v2 / v1 归一 / v2+接种) =="
 go run ./cmd/epidemic run -config testdata/scenario-v2.json > /dev/null
 go run ./cmd/epidemic run -config testdata/scenario-v1-legacy.json > /dev/null
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccine.json > /dev/null
 
 echo "== CLI: estimate + demo =="
 go run ./cmd/epidemic estimate -config testdata/scenario-v2.json -parallelism 4 > /dev/null

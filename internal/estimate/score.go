@@ -35,7 +35,7 @@ func validateInputs(sc *model.Scenario, obs model.ObservationSeries, b Bounds) e
 				"observations[%d] 引用未知分组 %q", i, o.GroupID)
 		}
 		switch o.Compartment {
-		case model.CompS, model.CompI, model.CompR, model.CompQ:
+		case model.CompS, model.CompI, model.CompR, model.CompQ, model.CompV:
 		case model.CompE:
 			if sc.Paradigm != model.ParadigmSEIR {
 				return model.NewError(model.ErrObservationMismatch,
@@ -112,6 +112,8 @@ func scoreSSE(sc *model.Scenario, obs model.ObservationSeries, beta float64) flo
 			modelVal = tr.R[g][k]
 		case model.CompQ:
 			modelVal = tr.Q[g][k]
+		case model.CompV:
+			modelVal = tr.V[g][k]
 		}
 		d := modelVal - o.Value
 		sse += d * d

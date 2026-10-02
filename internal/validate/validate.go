@@ -181,12 +181,31 @@ func validateMigration(sc *model.Scenario, g int) error {
 }
 
 func validateInterventions(sc *model.Scenario, ids map[string]int) error {
+	quotas, err := validateVaccineQuotas(sc)
+	if err != nil {
+		return err
+	}
 	for i, iv := range sc.Interventions {
 		if err := validateOneIntervention(sc, ids, i, iv); err != nil {
 			return err
 		}
+		if iv.Type == model.InterventionVaccination {
+			if err := validateVaccinationIntervention(sc, quotas, i, iv); err != nil {
+				return err
+			}
+		} else {
+			// 非接种干预不得携带接种专属字段（与其它类型的专属字段检查同理）。
+			if iv.DosesPerDay != 0 || iv.QuotaID != "" || iv.Priority != 0 {
+				return model.NewError(model.ErrInterventionInvalid,
+					"interventions[%d]: %s 不得设置 dosesPerDay/quotaId/priority",
+					i, iv.Type)
+			}
+		}
 	}
 	// 同类型、目标分组有交集且半开区间重叠 => 叠加口径不唯一，必须拒绝。
+	// 两个接种安排在同一分组同一时段重叠属于接种计划自相矛盾，单独归类，
+	// 便于与接触缩减/隔离的同类重叠区分；接种与其它类型“撞车”是允许的
+	// （不同类型可同时生效），不会走到这里。
 	for a := 0; a < len(sc.Interventions); a++ {
 		for b := a + 1; b < len(sc.Interventions); b++ {
 			x, y := sc.Interventions[a], sc.Interventions[b]
@@ -197,6 +216,11 @@ func validateInterventions(sc *model.Scenario, ids map[string]int) error {
 				continue
 			}
 			if groupsIntersect(x.Groups, y.Groups, ids) {
+				if x.Type == model.InterventionVaccination {
+					return model.NewError(model.ErrVaccinationConflict,
+						"interventions[%d] 与 interventions[%d] 均为 vaccination 且在重叠时段"+
+							"给同一分组接种（同一分组同一时段只允许一个接种安排）", a, b)
+				}
 				return model.NewError(model.ErrIntervalOverlap,
 					"interventions[%d] 与 interventions[%d] 同为 %s 且目标分组在重叠区间相交",
 					a, b, x.Type)
@@ -212,7 +236,8 @@ func validateOneIntervention(sc *model.Scenario, ids map[string]int, idx int, iv
 			"interventions[%d]: %s", idx, fmt.Sprintf(format, args...))
 	}
 	switch iv.Type {
-	case model.InterventionContactReduction, model.InterventionIsolation:
+	case model.InterventionContactReduction, model.InterventionIsolation,
+		model.InterventionVaccination:
 	default:
 		return at("未知干预类型 %q", iv.Type)
 	}
@@ -260,6 +285,8 @@ func validateOneIntervention(sc *model.Scenario, ids map[string]int, idx int, iv
 		if iv.Capacity != nil && !finiteNonNeg(*iv.Capacity) {
 			return at("capacity=%v 必须为非负有限值，或省略表示无界", *iv.Capacity)
 		}
+	case model.InterventionVaccination:
+		// 接种专属字段在 validateVaccinationIntervention 中校验。
 	}
 	return nil
 }

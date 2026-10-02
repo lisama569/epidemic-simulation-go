@@ -53,6 +53,17 @@ func Build(sc *model.Scenario) (*Schedule, error) {
 // ActiveAt 返回给定绝对时间 t（天）正在生效的干预（半开区间 [start,end)）。
 // 返回顺序按干预在情景中的原始下标排列，保证调用方遍历顺序确定。
 func (s *Schedule) ActiveAt(t float64) []model.Intervention {
+	idxs := s.ActiveIndicesAt(t)
+	out := make([]model.Intervention, 0, len(idxs))
+	for _, i := range idxs {
+		out = append(out, s.scenario.Interventions[i])
+	}
+	return out
+}
+
+// ActiveIndicesAt 返回给定绝对时间 t（天）正在生效的干预在情景干预列表中的
+// 原始下标，按下标升序排列，确定可复现。
+func (s *Schedule) ActiveIndicesAt(t float64) []int {
 	active := map[int]bool{}
 	for _, e := range s.edges {
 		if e.time > t {
@@ -71,9 +82,5 @@ func (s *Schedule) ActiveAt(t float64) []model.Intervention {
 		idxs = append(idxs, i)
 	}
 	sort.Ints(idxs)
-	out := make([]model.Intervention, 0, len(idxs))
-	for _, i := range idxs {
-		out = append(out, s.scenario.Interventions[i])
-	}
-	return out
+	return idxs
 }

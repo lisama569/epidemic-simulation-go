@@ -21,29 +21,61 @@ const (
 // 再按迁移矩阵重排 S/E/I/R；Q（隔离中）不参与迁移。全程无随机数，
 // 重复运行与任何并行度下结果逐位一致。
 func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, error) {
+	tr, _, _, err := runFrom(sc, sched, 0, nil, nil, 0)
+	return tr, err
+}
+
+// totalSteps 返回情景的总积分步数 N=round(horizon/step)。
+func totalSteps(sc *model.Scenario) int {
+	return int(math.Round(sc.HorizonDays / sc.StepDays))
+}
+
+// runFrom 从指定的已完成步数 stepCompleted 与该时刻状态继续推演。
+// vaccSnaps 非空时恢复额度池跨步状态（接种中途恢复用）。
+// stopAfter>0 时在完成 stopAfter 个总步数后提前返回（用于检查点），
+// 0 表示一直推演到 horizon。
+func runFrom(sc *model.Scenario, sched *intervention.Schedule,
+	stepCompleted int, st0 *model.State, vaccSnaps []quotaSnapshot,
+	stopAfter int) (
+	*model.Trajectory, *model.State, []quotaSnapshot, error) {
 	if err := validate.Scenario(sc); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	if sched == nil {
 		var err error
 		sched, err = intervention.Build(sc)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	}
 
 	g := len(sc.Groups)
-	n := int(math.Round(sc.HorizonDays / sc.StepDays))
+	n := totalSteps(sc)
+	end := n
+	if stopAfter > 0 {
+		end = stopAfter
+	}
+	if stepCompleted > end {
+		return nil, nil, nil, model.NewError(model.ErrCheckpoint,
+			"已完成步数 %d 超过中断目标 %d", stepCompleted, end)
+	}
 	dt := sc.StepDays
 
 	st := &model.State{
 		S: make([]float64, g), E: make([]float64, g),
-		I: make([]float64, g), R: make([]float64, g), Q: make([]float64, g),
+		I: make([]float64, g), R: make([]float64, g),
+		Q: make([]float64, g), V: make([]float64, g),
 	}
 	groupIDs := make([]string, g)
 	for i, grp := range sc.Groups {
 		groupIDs[i] = grp.ID
 		st.S[i], st.E[i], st.I[i], st.R[i] = grp.S0, grp.E0, grp.I0, grp.R0
+	}
+	if st0 != nil {
+		st.S, st.E, st.I, st.R, st.Q, st.V =
+			append([]float64(nil), st0.S...), append([]float64(nil), st0.E...),
+			append([]float64(nil), st0.I...), append([]float64(nil), st0.R...),
+			append([]float64(nil), st0.Q...), append([]float64(nil), st0.V...)
 	}
 
 	tr := &model.Trajectory{GroupIDs: groupIDs}
@@ -55,7 +87,7 @@ func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, e
 		}
 		return v
 	}
-	tr.S, tr.E, tr.I, tr.R, tr.Q = alloc(), alloc(), alloc(), alloc(), alloc()
+	tr.S, tr.E, tr.I, tr.R, tr.Q, tr.V = alloc(), alloc(), alloc(), alloc(), alloc(), alloc()
 
 	record := func(t float64) {
 		tr.Times = append(tr.Times, t)
@@ -65,24 +97,37 @@ func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, e
 			tr.I[i] = append(tr.I[i], st.I[i])
 			tr.R[i] = append(tr.R[i], st.R[i])
 			tr.Q[i] = append(tr.Q[i], st.Q[i])
+			tr.V[i] = append(tr.V[i], st.V[i])
 		}
 	}
-	record(0)
+	record(float64(stepCompleted) * dt)
 
-	for k := 0; k < n; k++ {
+	// vacc 持有跨步的额度池运行态（剩余额度、当前自然日）。
+	vacc := newVaccineRuntime(sc)
+	if vaccSnaps != nil {
+		vacc.Restore(vaccSnaps)
+	}
+	for k := stepCompleted; k < end; k++ {
 		t := float64(k) * dt
-		active := sched.ActiveAt(t)
-		step(sc, st, active, dt, t, &tr.CapacityEvents)
+		activeIdx := sched.ActiveIndicesAt(t)
+		active := make([]model.Intervention, len(activeIdx))
+		for i, ix := range activeIdx {
+			active[i] = sc.Interventions[ix]
+		}
+		step(sc, st, active, activeIdx, dt, t, &tr.CapacityEvents, vacc, &tr.VaccinationEvents)
 		if sc.MigrationMatrix != nil {
 			applyMigration(sc.MigrationMatrix, st, dt)
 		}
 		record(float64(k+1) * dt)
 	}
-	return tr, nil
+	return tr, st, vacc.Snapshot(), nil
 }
 
-// step 推进一个欧拉步：接触缩减 -> 感染力 -> SEIR 转化 -> 隔离（含容量）。
-func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, t float64, events *[]model.CapacityEvent) {
+// step 推进一个欧拉步：接触缩减 -> 感染力 -> SEIR 转化 -> 隔离（含容量）
+// -> 接种（受共享额度约束）。
+func step(sc *model.Scenario, st *model.State, active []model.Intervention,
+	activeIdx []int, dt, t float64, events *[]model.CapacityEvent,
+	vacc *vaccineRuntime, vaccEvents *[]model.VaccinationEvent) {
 	g := len(sc.Groups)
 
 	// 1) 有效接触矩阵：contact_reduction 对目标分组的接触行乘 (1-strength*compliance)。
@@ -101,7 +146,8 @@ func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, 
 		}
 	}
 
-	// 2) 感染力。被隔离者不在传播环内，流行率分母/分子都只计活动人口。
+	// 2) 感染力。被隔离者与免疫接种者不在传播环内，流行率分母/分子都只计活动人口，
+	// V 仓个体既不被感染也不参与传播，故分母排除 V。
 	lambda := make([]float64, g)
 	for a := 0; a < g; a++ {
 		l := 0.0
@@ -155,12 +201,28 @@ func step(sc *model.Scenario, st *model.State, active []model.Intervention, dt, 
 		dQ[a] += admit[a]
 	}
 
+	// 5) 接种：成功者从 S 移入 V。感染已经从 dS 扣减，接种需求必须基于
+	// “本步感染后的 S 存量”封顶，否则感染与接种各自封顶会叠加超扣 S。
+	// 只复制 S 分量供额度分配读取，避免与真实状态共享底层切片。
+	dV := make([]float64, g)
+	sAfterInfection := make([]float64, g)
+	for a := 0; a < g; a++ {
+		sAfterInfection[a] = enforceNonNeg(st.S[a] + dS[a])
+	}
+	stProbe := *st
+	stProbe.S = sAfterInfection
+	vacc.apply(sc, &stProbe, active, activeIdx, dt, t, dV, vaccEvents)
+	for a := 0; a < g; a++ {
+		dS[a] -= dV[a]
+	}
+
 	for a := 0; a < g; a++ {
 		st.S[a] = enforceNonNeg(st.S[a] + dS[a])
 		st.E[a] = enforceNonNeg(st.E[a] + dE[a])
 		st.I[a] = enforceNonNeg(st.I[a] + dI[a])
 		st.R[a] = enforceNonNeg(st.R[a] + dR[a])
 		st.Q[a] = enforceNonNeg(st.Q[a] + dQ[a])
+		st.V[a] = enforceNonNeg(st.V[a] + dV[a])
 	}
 }
 
@@ -277,6 +339,8 @@ func applyMigration(m [][]float64, st *model.State, dt float64) {
 		st.E = step(st.E)
 		st.I = step(st.I)
 		st.R = step(st.R)
+		// V 仓同样参与迁移：接种者随其分组流动，但在新分组仍不感染、不传播。
+		st.V = step(st.V)
 	}
 }
 
