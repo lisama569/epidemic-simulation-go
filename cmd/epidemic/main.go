@@ -71,7 +71,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: epidemic <command> [flags]
 
 commands:
-  run       -config <scenario.json>
+  run       -config <scenario.json> [-checkpoint-dir <dir>] [-stop-after <steps>]
   estimate  -config <scenario.json> [-checkpoint-dir <dir>] [-parallelism n] [-resume]
   demo`)
 }
@@ -87,6 +87,8 @@ func loadScenario(path string) (*model.Scenario, error) {
 // runResult 是 run 子命令的结构化输出。
 type runResult struct {
 	Steps                 int                      `json:"steps"`
+	Completed             bool                     `json:"completed"`
+	CheckpointRestored    bool                     `json:"checkpointRestored"`
 	GroupIDs              []string                 `json:"groupIds"`
 	PeakI                 map[string]float64       `json:"peakInfected"`
 	FinalR                map[string]float64       `json:"finalRemoved"`
@@ -100,6 +102,8 @@ type runResult struct {
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "情景配置 JSON 路径（v1 自动归一，v2 严格解析）")
+	cpDir := fs.String("checkpoint-dir", "", "推演检查点目录（空则不落盘/恢复）")
+	stopAfter := fs.Int("stop-after", 0, "完成指定步数后中断并落盘（断点可在任意步边界）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -114,12 +118,17 @@ func runCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := engine.Run(sc, sched)
+	out, err := engine.RunWithResume(sc, sched, engine.ResumeOptions{
+		CheckpointDir: *cpDir, StopAfterSteps: *stopAfter,
+	})
 	if err != nil {
 		return err
 	}
-	res := runResult{Steps: len(tr.Times) - 1, GroupIDs: tr.GroupIDs,
-		PeakI: map[string]float64{}, FinalR: map[string]float64{}, FinalV: map[string]float64{},
+	tr := out.Trajectory
+	res := runResult{Steps: out.Steps, Completed: out.Completed,
+		CheckpointRestored: out.CheckpointRestored,
+		GroupIDs:           tr.GroupIDs,
+		PeakI:              map[string]float64{}, FinalR: map[string]float64{}, FinalV: map[string]float64{},
 		CapacityEvents: tr.CapacityEvents, CapacityCount: len(tr.CapacityEvents),
 		VaccinationEvents: tr.VaccinationEvents, VaccinationEventCount: len(tr.VaccinationEvents)}
 	for g, gid := range tr.GroupIDs {

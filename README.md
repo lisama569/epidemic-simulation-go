@@ -12,10 +12,10 @@
 | `internal/config` | JSON 配置解析（v2 严格）、v1 旧配置按确定规则归一到 v2 |
 | `internal/validate` | 情景全部自洽性校验，矛盾输入被明确拒绝（可区分错误种类） |
 | `internal/intervention` | 分阶段干预时间轴（半开区间、确定性生效集合查询） |
-| `internal/engine` | 确定性固定步长推演、容量约束、迁移、有界并行批量推演 |
+| `internal/engine` | 确定性固定步长推演、容量约束、迁移、有界并行批量推演、推演级断点续跑 |
 | `internal/synthetic` | 固定种子的合成观测生成与内置参考情景 |
 | `internal/estimate` | beta 参数网格估计、收敛判定、不确定性区间 |
-| `internal/checkpoint` | 检查点摘要校验、单文件落盘与续算 |
+| `internal/checkpoint` | 检查点摘要校验、单文件落盘与续算（估计轮次 / 推演步边界） |
 | `cmd/epidemic` | `run` / `estimate` / `demo` 三个本地子命令 |
 
 ## 2. 建模口径与状态约定
@@ -171,6 +171,28 @@
 - 检查点始终是**单个固定大小文件**（原子覆盖写），不随轮数或情景规模
   累积增长。评估只保留当轮格点的 SSE 数组，内存随格点数有界。
 
+### 5.5 推演级断点续跑（含接种）
+
+`run` 子命令与 `engine.RunWithResume` 支持把一次推演在**任意步边界**
+（`t=k·stepDays`，不必是整天，可正处额度争抢中段）落盘、之后原样续跑：
+
+- 断点保存（`<dir>/run-checkpoint.json`，单文件原子覆盖写）：
+  已完成步数 `k`、六个仓室（含 V 免疫仓）的全分组状态、
+  **每个疫苗额度池在断点时刻的结转余额**（accumulate 池的累计结余，
+  非结转池恒为 0）、断点前已产生的全部容量/接种事件、轨迹前缀，
+  以及情景的 SHA-256 摘要；
+- 恢复时摘要必须匹配，否则归类 `checkpoint_invalid` 拒绝续算；
+  检查点形状（分组数/分组 id/额度池数/序列长度）与情景不符同样拒绝，
+  绝不带病续算；
+- 续跑从第 `k` 步边界按与不中断运行**完全相同**的步进规则继续，
+  因此续跑结果与一口气跑完**逐位一致**：各分组六仓室轨迹、每一次
+  额度不足的接种记录、每一次容量受限记录逐条相等；总人口守恒、
+  当日接种不超过当日额度等不变量在断点前后同样成立；
+- 断点可多次接力（中断→续跑→再中断→再续跑），跑完后再次以同一目录
+  运行会命中最终检查点、直接复现完整轨迹（幂等）；
+- 续跑结果与同一情景在任意并行度下批量推演的结果逐位一致
+  （推演本身无随机数，并行只作用于情景间）。
+
 ## 6. 错误归类（可区分的失败原因）
 
 | ErrorKind | 触发条件 |
@@ -188,7 +210,7 @@
 | `observation_paradigm_mismatch` | 观测与模型口径不兼容 |
 | `estimate_not_converged` | 估计未达收敛（结果中如实报告） |
 | `estimate_outside_feasible_domain` | 最优点贴可行域边界，剖面被截断 |
-| `checkpoint_invalid` | 检查点缺失、损坏或摘要不匹配 |
+| `checkpoint_invalid` | 检查点缺失、损坏、形状不符或摘要不匹配（估计轮次与推演断点同口径） |
 | `vaccination_invalid` | 接种安排非法：速率非正/非有限、携带 strength/capacity、区间超出额度池 |
 | `vaccine_quota_invalid` | 额度池定义非法：额度为负/非有限、id 为空或重复 |
 | `vaccine_quota_reference_invalid` | 接种安排未声明 quotaId 或引用不存在的额度池 |
@@ -239,6 +261,18 @@ go run ./cmd/epidemic run -config testdata/scenario-v1-legacy.json
 # 含免疫接种的情景（输出 finalVaccinated 与 vaccinationEvents）
 go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json
 
+# 接种情景断点续跑：stepDays=0.5，第 25 步即 t=12.5（非整日、
+# 两分组正争抢同一额度池）处中断落盘，再原样续跑；
+# 两次输出与一口气跑完逐字段一致（可用 diff 复核）
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json \
+  -checkpoint-dir ./runcp -stop-after 25
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json \
+  -checkpoint-dir ./runcp > /tmp/resumed.json
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json \
+  > /tmp/full.json
+diff <(grep -v checkpointRestored /tmp/resumed.json) \
+     <(grep -v checkpointRestored /tmp/full.json) && echo "续跑==一口气跑完"
+
 # 合成观测 + 参数估计（收敛判定/区间/并行）
 go run ./cmd/epidemic estimate -config testdata/scenario-v2.json -parallelism 4
 
@@ -257,6 +291,8 @@ go run ./cmd/epidemic demo
 - 容量测试：`I0`、隔离速率、依从度、容量、首次容量事件时间/分组/需求；
 - 接种测试：每日额度、是否结转、优先级、首日各分组实配、额度不足事件的
   时间/分组/需求/实配，以及并列优先级的稳定决胜依据；
+- 断点续跑测试：步长与总步数、额度池参数与优先级、不中断运行的事件总数，
+  以及逐一步边界（含非整日、额度争抢中段）中断续跑后逐位一致的判定结论；
 - 合成数据：`seed`、`noiseSD`、同/异种子一致性结论；
 - 估计：`betaHat`、区间、末轮位移、阈值、连续稳定轮数与收敛原因；
 - 迁移：各 `stepDays` 下的守恒结论。
