@@ -82,12 +82,12 @@ func validateVaccineQuotas(sc *model.Scenario) (map[string]bool, error) {
 			return nil, at("dailyLimit=%v 必须为非负有限值", q.DailyLimit)
 		}
 		if !(q.StartDays >= 0 && q.EndDays > q.StartDays && q.EndDays <= sc.HorizonDays+gridTol) {
-			return nil, model.NewError(model.ErrTimelineReversed,
+			return nil, model.NewError(model.ErrVaccinationTimeline,
 				"vaccineQuotas[%d]: 区间 [%.6f,%.6f) 不满足 0<=start<end<=horizon(%.6f)",
 				i, q.StartDays, q.EndDays, sc.HorizonDays)
 		}
 		if !aligned(q.StartDays, sc.StepDays) || !aligned(q.EndDays, sc.StepDays) {
-			return nil, model.NewError(model.ErrTimelineReversed,
+			return nil, model.NewError(model.ErrVaccinationTimeline,
 				"vaccineQuotas[%d]: 区间端点必须落在步长 %.6f 的整数倍网格上", i, sc.StepDays)
 		}
 	}
@@ -224,6 +224,7 @@ func validateInterventions(sc *model.Scenario, ids map[string]int, quotaIDs map[
 		}
 	}
 	// 同类型、目标分组有交集且半开区间重叠 => 叠加口径不唯一，必须拒绝。
+	// 接种安排之间的互相矛盾单独归类，与其他干预的区间重叠一眼可区分。
 	for a := 0; a < len(sc.Interventions); a++ {
 		for b := a + 1; b < len(sc.Interventions); b++ {
 			x, y := sc.Interventions[a], sc.Interventions[b]
@@ -233,11 +234,17 @@ func validateInterventions(sc *model.Scenario, ids map[string]int, quotaIDs map[
 			if !intervalsOverlap(x.StartDays, x.EndDays, y.StartDays, y.EndDays) {
 				continue
 			}
-			if groupsIntersect(x.Groups, y.Groups, ids) {
-				return model.NewError(model.ErrIntervalOverlap,
-					"interventions[%d] 与 interventions[%d] 同为 %s 且目标分组在重叠区间相交",
-					a, b, x.Type)
+			if !groupsIntersect(x.Groups, y.Groups, ids) {
+				continue
 			}
+			if x.Type == model.InterventionVaccination {
+				return model.NewError(model.ErrVaccinationScheduleConflict,
+					"interventions[%d] 与 interventions[%d] 同为 vaccination 且目标分组在重叠区间相交（同一分组同一时段的接种安排互相矛盾）",
+					a, b)
+			}
+			return model.NewError(model.ErrIntervalOverlap,
+				"interventions[%d] 与 interventions[%d] 同为 %s 且目标分组在重叠区间相交",
+				a, b, x.Type)
 		}
 	}
 	return nil
@@ -271,13 +278,18 @@ func validateOneIntervention(sc *model.Scenario, ids map[string]int, quotaIDs ma
 		}
 		seen[gid] = true
 	}
+	// 时间轴问题按干预类型归类：接种相关单独归类，与其他干预一眼可区分。
+	timelineKind := model.ErrTimelineReversed
+	if iv.Type == model.InterventionVaccination {
+		timelineKind = model.ErrVaccinationTimeline
+	}
 	if !(iv.StartDays >= 0 && iv.EndDays > iv.StartDays && iv.EndDays <= sc.HorizonDays+gridTol) {
-		return model.NewError(model.ErrTimelineReversed,
+		return model.NewError(timelineKind,
 			"interventions[%d]: 区间 [%.6f,%.6f) 不满足 0<=start<end<=horizon(%.6f)",
 			idx, iv.StartDays, iv.EndDays, sc.HorizonDays)
 	}
 	if !aligned(iv.StartDays, sc.StepDays) || !aligned(iv.EndDays, sc.StepDays) {
-		return model.NewError(model.ErrTimelineReversed,
+		return model.NewError(timelineKind,
 			"interventions[%d]: 区间端点必须落在步长 %.6f 的整数倍网格上", idx, sc.StepDays)
 	}
 	if !(iv.Compliance > 0 && iv.Compliance <= 1) {

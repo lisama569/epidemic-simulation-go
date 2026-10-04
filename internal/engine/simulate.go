@@ -5,7 +5,6 @@ import (
 
 	"github.com/lisama569/epidemic-simulation-go/internal/intervention"
 	"github.com/lisama569/epidemic-simulation-go/internal/model"
-	"github.com/lisama569/epidemic-simulation-go/internal/validate"
 )
 
 const (
@@ -20,71 +19,13 @@ const (
 // 在 t_k 生效当且仅当 start<=t_k<end。每步先做仓室动力学（固定步长欧拉），
 // 再按迁移矩阵重排 S/E/I/R；Q（隔离中）与 V（已免疫）不参与迁移。
 // 全程无随机数，重复运行与任何并行度下结果逐位一致。
+// 需要断点续跑时使用 RunResumable。
 func Run(sc *model.Scenario, sched *intervention.Schedule) (*model.Trajectory, error) {
-	if err := validate.Scenario(sc); err != nil {
+	res, err := RunResumable(sc, sched, ResumeOptions{})
+	if err != nil {
 		return nil, err
 	}
-	if sched == nil {
-		var err error
-		sched, err = intervention.Build(sc)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	g := len(sc.Groups)
-	n := int(math.Round(sc.HorizonDays / sc.StepDays))
-	dt := sc.StepDays
-
-	st := &model.State{
-		S: make([]float64, g), E: make([]float64, g),
-		I: make([]float64, g), R: make([]float64, g),
-		Q: make([]float64, g), V: make([]float64, g),
-	}
-	groupIDs := make([]string, g)
-	for i, grp := range sc.Groups {
-		groupIDs[i] = grp.ID
-		st.S[i], st.E[i], st.I[i], st.R[i] = grp.S0, grp.E0, grp.I0, grp.R0
-	}
-
-	tr := &model.Trajectory{GroupIDs: groupIDs}
-	tr.Times = make([]float64, 0, n+1)
-	alloc := func() [][]float64 {
-		v := make([][]float64, g)
-		for i := range v {
-			v[i] = make([]float64, 0, n+1)
-		}
-		return v
-	}
-	tr.S, tr.E, tr.I, tr.R, tr.Q, tr.V = alloc(), alloc(), alloc(), alloc(), alloc(), alloc()
-
-	record := func(t float64) {
-		tr.Times = append(tr.Times, t)
-		for i := 0; i < g; i++ {
-			tr.S[i] = append(tr.S[i], st.S[i])
-			tr.E[i] = append(tr.E[i], st.E[i])
-			tr.I[i] = append(tr.I[i], st.I[i])
-			tr.R[i] = append(tr.R[i], st.R[i])
-			tr.Q[i] = append(tr.Q[i], st.Q[i])
-			tr.V[i] = append(tr.V[i], st.V[i])
-		}
-	}
-	record(0)
-
-	// 疫苗额度台账：每个额度池的结转余额（仅 accumulate 池非零），
-	// 随推演推进确定性地更新。
-	ledger := newVaccineLedger(sc)
-
-	for k := 0; k < n; k++ {
-		t := float64(k) * dt
-		active := sched.ActiveAt(t)
-		step(sc, st, active, dt, t, ledger, &tr.CapacityEvents, &tr.VaccinationEvents)
-		if sc.MigrationMatrix != nil {
-			applyMigration(sc.MigrationMatrix, st, dt)
-		}
-		record(float64(k+1) * dt)
-	}
-	return tr, nil
+	return res.Trajectory, nil
 }
 
 // step 推进一个欧拉步：接触缩减 -> 感染力 -> SEIR 转化 -> 隔离（含容量）

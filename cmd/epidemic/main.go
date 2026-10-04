@@ -91,15 +91,22 @@ type runResult struct {
 	PeakI                 map[string]float64       `json:"peakInfected"`
 	FinalR                map[string]float64       `json:"finalRemoved"`
 	FinalV                map[string]float64       `json:"finalVaccinated"`
-	CapacityEvents        []model.CapacityEvent    `json:"capacityEvents"`
+	CapacityEvents        []model.CapacityEvent    `json:"capacityEvents,omitempty"`
 	CapacityCount         int                      `json:"capacityEventCount"`
-	VaccinationEvents     []model.VaccinationEvent `json:"vaccinationEvents"`
+	VaccinationEvents     []model.VaccinationEvent `json:"vaccinationEvents,omitempty"`
 	VaccinationEventCount int                      `json:"vaccinationEventCount"`
+	// 断点续跑相关状态：Completed=false 表示在断点处中断，可续跑。
+	Completed  bool `json:"completed"`
+	StepsDone  int  `json:"stepsDone"`
+	TotalSteps int  `json:"totalSteps"`
+	Restored   bool `json:"restored"`
 }
 
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "情景配置 JSON 路径（v1 自动归一，v2 严格解析）")
+	cpDir := fs.String("checkpoint-dir", "", "推演断点目录（非空时中断落盘/自动续跑）")
+	stopAfter := fs.Int("stop-after-steps", 0, "完成指定步数后中断并写断点（0 表示不中断）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -114,14 +121,19 @@ func runCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	tr, err := engine.Run(sc, sched)
+	run, err := engine.RunResumable(sc, sched, engine.ResumeOptions{
+		CheckpointDir: *cpDir, StopAfterSteps: *stopAfter,
+	})
 	if err != nil {
 		return err
 	}
+	tr := run.Trajectory
 	res := runResult{Steps: len(tr.Times) - 1, GroupIDs: tr.GroupIDs,
 		PeakI: map[string]float64{}, FinalR: map[string]float64{}, FinalV: map[string]float64{},
 		CapacityEvents: tr.CapacityEvents, CapacityCount: len(tr.CapacityEvents),
-		VaccinationEvents: tr.VaccinationEvents, VaccinationEventCount: len(tr.VaccinationEvents)}
+		VaccinationEvents: tr.VaccinationEvents, VaccinationEventCount: len(tr.VaccinationEvents),
+		Completed: run.Completed, StepsDone: run.StepsDone, TotalSteps: run.TotalSteps,
+		Restored: run.Restored}
 	for g, gid := range tr.GroupIDs {
 		peak := 0.0
 		for _, v := range tr.I[g] {
@@ -133,7 +145,15 @@ func runCmd(args []string) error {
 		res.FinalR[gid] = tr.R[g][len(tr.R[g])-1]
 		res.FinalV[gid] = tr.V[g][len(tr.V[g])-1]
 	}
-	return printJSON(res)
+	if err := printJSON(res); err != nil {
+		return err
+	}
+	if !run.Completed {
+		// 中断是确定性的演示行为：如实输出并以非零退出码提示调用方可续跑。
+		return fmt.Errorf("推演在第 %d/%d 步中断（断点已写入 %q），可用同一 -checkpoint-dir 续跑",
+			run.StepsDone, run.TotalSteps, *cpDir)
+	}
+	return nil
 }
 
 func estimateCmd(args []string) error {

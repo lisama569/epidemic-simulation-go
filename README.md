@@ -15,7 +15,7 @@
 | `internal/engine` | 确定性固定步长推演、容量约束、迁移、有界并行批量推演 |
 | `internal/synthetic` | 固定种子的合成观测生成与内置参考情景 |
 | `internal/estimate` | beta 参数网格估计、收敛判定、不确定性区间 |
-| `internal/checkpoint` | 检查点摘要校验、单文件落盘与续算 |
+| `internal/checkpoint` | 检查点摘要校验、单文件落盘与续算（估计轮次 + 推演步两级断点） |
 | `cmd/epidemic` | `run` / `estimate` / `demo` 三个本地子命令 |
 
 ## 2. 建模口径与状态约定
@@ -171,6 +171,29 @@
 - 检查点始终是**单个固定大小文件**（原子覆盖写），不随轮数或情景规模
   累积增长。评估只保留当轮格点的 SSE 数组，内存随格点数有界。
 
+### 5.5 推演级断点续跑（含接种）
+
+估计检查点解决的是"网格评估跑到第几轮"；**单次推演跑到一半被打断**
+（例如含接种的长 horizon 情景）由推演级断点解决：
+
+- `engine.RunResumable(sc, sched, ResumeOptions{CheckpointDir, StopAfterSteps})`
+  在完成 `StopAfterSteps` 步后把断点写入 `<dir>/simulation-checkpoint.json`
+  （与估计检查点分文件存放）；同一目录再次调用即自动续跑。
+- **断点可落在任意推演步**：步长小于 1 天时可落在非整日时刻，也可落在
+  额度正紧张、多个分组争抢同一额度池的配给中间，不要求卡在整天边界。
+- 断点保存的内容（足以原样续跑的全部状态）：
+  - 已完成的步数与对应日期（`step`、`timeDays`）；
+  - 六个仓室（含免疫仓 `V`）各分组当时人数；
+  - **每个额度池当时的结转余额**（`quotaCarry`，含 `accumulate` 池
+    一路累积的余额）；
+  - 已记录的轨迹与全部容量/接种事件。
+- 续跑时先按情景 SHA-256 摘要校验一致性，不匹配归类 `checkpoint_invalid`
+  拒绝续跑；随后从断点步原样接上。浮点状态经 JSON 最短表示精确往返，
+  故**续跑结果与不中断运行逐位一致**：六仓室人数、每一次额度不足的
+  接种记录、每一次容量受限的记录逐条相等；续跑前后总人口守恒，
+  任何一天实际接种不超过当天额度（含结转）。
+- 断点文件同样是单文件原子覆盖写，不随步数累积增长。
+
 ## 6. 错误归类（可区分的失败原因）
 
 | ErrorKind | 触发条件 |
@@ -191,11 +214,18 @@
 | `checkpoint_invalid` | 检查点缺失、损坏或摘要不匹配 |
 | `vaccination_invalid` | 接种安排非法：速率非正/非有限、携带 strength/capacity、区间超出额度池 |
 | `vaccine_quota_invalid` | 额度池定义非法：额度为负/非有限、id 为空或重复 |
-| `vaccine_quota_reference_invalid` | 接种安排未声明 quotaId 或引用不存在的额度池 |
+| `vaccine_quota_reference_invalid` | 接种安排（含其优先级声明）未声明 quotaId 或引用不存在的额度池 |
+| `vaccination_schedule_conflict` | 同一分组同一时段的接种安排互相矛盾（接种撞接种） |
+| `vaccination_timeline_invalid` | 接种相关时间轴非法：额度池/接种区间倒退、越界或不对齐步长网格 |
 
-额度池/接种安排的时间轴问题（倒退、越界、不对齐网格）归入既有的
-`timeline_reversed`；同组同时段互相矛盾的接种安排归入既有的
-`intervention_interval_overlap`——与其他干预的同类问题口径一致、可区分。
+接种相关的非法配置与一般干预问题**分开归类、一眼可区分**：
+
+- 接种撞接种是 `vaccination_schedule_conflict`；其他干预撞其他干预仍是
+  `intervention_interval_overlap`；接种与其他类型干预同时生效是合法共存，不算撞车。
+- 额度池与接种安排的时间轴问题（倒退/越界/不对齐）是 `vaccination_timeline_invalid`；
+  情景级时间轴与其他干预的同类问题仍是 `timeline_reversed`。
+- 额度为负或不是有限数是 `vaccine_quota_invalid`；优先级所属的接种安排引用不到
+  额度池是 `vaccine_quota_reference_invalid`。
 
 任何矛盾输入都返回上述归类错误，**不静默套用默认值**。唯一的缺省归一发生在
 v1→v2：旧干预缺少 `adherence` 时按确定规则取 1.0（旧格式中该字段语义统一），
@@ -239,6 +269,13 @@ go run ./cmd/epidemic run -config testdata/scenario-v1-legacy.json
 # 含免疫接种的情景（输出 finalVaccinated 与 vaccinationEvents）
 go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json
 
+# 接种情景推演级断点续跑：第 20 步中断（非零退出码提示可续跑），
+# 再用同一目录续跑；续跑输出与不中断运行逐字段一致（verify.sh 自动比对）
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json \
+  -checkpoint-dir ./simcp -stop-after-steps 20
+go run ./cmd/epidemic run -config testdata/scenario-v2-vaccination.json \
+  -checkpoint-dir ./simcp
+
 # 合成观测 + 参数估计（收敛判定/区间/并行）
 go run ./cmd/epidemic estimate -config testdata/scenario-v2.json -parallelism 4
 
@@ -259,4 +296,6 @@ go run ./cmd/epidemic demo
   时间/分组/需求/实配，以及并列优先级的稳定决胜依据；
 - 合成数据：`seed`、`noiseSD`、同/异种子一致性结论；
 - 估计：`betaHat`、区间、末轮位移、阈值、连续稳定轮数与收敛原因；
+- 断点续跑：断点步（含非整日、额度争抢进行中）、续跑与不中断运行
+  逐位一致的结论、多断点链式续跑与多并行度一致性；
 - 迁移：各 `stepDays` 下的守恒结论。

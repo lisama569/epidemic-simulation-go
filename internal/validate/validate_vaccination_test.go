@@ -59,10 +59,10 @@ func TestVaccinationTimelineInvalid(t *testing.T) {
 	for name, mut := range cases {
 		s := vaxBase()
 		mut(s)
-		if k := kindOf(t, Scenario(s)); k != model.ErrTimelineReversed {
-			t.Fatalf("%s: kind=%s 期望 %s", name, k, model.ErrTimelineReversed)
+		if k := kindOf(t, Scenario(s)); k != model.ErrVaccinationTimeline {
+			t.Fatalf("%s: kind=%s 期望 %s", name, k, model.ErrVaccinationTimeline)
 		}
-		t.Logf("[%s] 拒绝原因 kind=%s", name, model.ErrTimelineReversed)
+		t.Logf("[%s] 拒绝原因 kind=%s", name, model.ErrVaccinationTimeline)
 	}
 }
 
@@ -105,16 +105,42 @@ func TestVaccinationInterventionInvalid(t *testing.T) {
 }
 
 // TestVaccinationOverlapRejected 验证同一分组同一时段互相矛盾的两项接种安排
-// 被归类为区间重叠（与既有干预同一口径）。
+// 被归类为接种排期冲突（与其他干预的区间重叠一眼可区分）。
 func TestVaccinationOverlapRejected(t *testing.T) {
 	s := vaxBase()
 	s.Interventions = append(s.Interventions, model.Intervention{
 		Type: model.InterventionVaccination, Groups: []string{"a"},
 		StartDays: 4, EndDays: 6, RatePerDay: 0.2, Compliance: 1.0, QuotaID: "nat"})
-	if k := kindOf(t, Scenario(s)); k != model.ErrIntervalOverlap {
-		t.Fatalf("同组同时段接种冲突: kind=%s 期望 %s", k, model.ErrIntervalOverlap)
+	if k := kindOf(t, Scenario(s)); k != model.ErrVaccinationScheduleConflict {
+		t.Fatalf("同组同时段接种冲突: kind=%s 期望 %s", k, model.ErrVaccinationScheduleConflict)
 	}
-	t.Logf("同组同时段接种冲突拒绝原因 kind=%s", model.ErrIntervalOverlap)
+	t.Logf("同组同时段接种冲突拒绝原因 kind=%s", model.ErrVaccinationScheduleConflict)
+}
+
+// TestVaccinationConflictVsOtherOverlap 验证"撞车"归类可区分：
+// 接种撞接种是 vaccination_schedule_conflict，其他干预撞其他干预仍是
+// intervention_interval_overlap，两者不会混淆。
+func TestVaccinationConflictVsOtherOverlap(t *testing.T) {
+	// 隔离撞隔离：保持既有归类。
+	s := vaxBase()
+	s.Interventions = append(s.Interventions,
+		model.Intervention{Type: model.InterventionIsolation, Groups: []string{"a"},
+			StartDays: 2, EndDays: 6, RatePerDay: 0.5, Compliance: 1.0},
+		model.Intervention{Type: model.InterventionIsolation, Groups: []string{"a"},
+			StartDays: 4, EndDays: 8, RatePerDay: 0.5, Compliance: 1.0})
+	if k := kindOf(t, Scenario(s)); k != model.ErrIntervalOverlap {
+		t.Fatalf("隔离撞隔离: kind=%s 期望 %s", k, model.ErrIntervalOverlap)
+	}
+	// 接种撞接种：新归类，与上面一眼可区分。
+	s2 := vaxBase()
+	s2.Interventions = append(s2.Interventions, model.Intervention{
+		Type: model.InterventionVaccination, Groups: []string{"a"},
+		StartDays: 4, EndDays: 6, RatePerDay: 0.2, Compliance: 1.0, QuotaID: "nat"})
+	if k := kindOf(t, Scenario(s2)); k != model.ErrVaccinationScheduleConflict {
+		t.Fatalf("接种撞接种: kind=%s 期望 %s", k, model.ErrVaccinationScheduleConflict)
+	}
+	t.Logf("撞车归类可区分: 隔离撞隔离=%s, 接种撞接种=%s",
+		model.ErrIntervalOverlap, model.ErrVaccinationScheduleConflict)
 }
 
 // TestVaccinationCrossTypeDistinguishable 验证接种与其他干预撞车时

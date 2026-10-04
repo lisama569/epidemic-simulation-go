@@ -23,8 +23,14 @@ const (
 	ErrVaccinationInvalid ErrorKind = "vaccination_invalid"
 	// ErrVaccineQuotaInvalid 疫苗额度池定义非法（额度为负/非有限、时间轴非法、id 重复等）。
 	ErrVaccineQuotaInvalid ErrorKind = "vaccine_quota_invalid"
-	// ErrVaccineQuotaReference 接种安排引用了不存在的额度池。
+	// ErrVaccineQuotaReference 接种安排（含其优先级声明）引用了不存在的额度池。
 	ErrVaccineQuotaReference ErrorKind = "vaccine_quota_reference_invalid"
+	// ErrVaccinationScheduleConflict 同一分组同一时段的接种安排互相矛盾
+	// （与其他类型干预的区间重叠 intervention_interval_overlap 区分开）。
+	ErrVaccinationScheduleConflict ErrorKind = "vaccination_schedule_conflict"
+	// ErrVaccinationTimeline 接种相关时间轴非法：额度池或接种安排的区间
+	// 倒退/越界/不对齐步长网格（与一般时间轴问题 timeline_reversed 区分开）。
+	ErrVaccinationTimeline ErrorKind = "vaccination_timeline_invalid"
 )
 
 // ValidationError 携带归类原因与可读细节，便于调用方按 Kind 区分处理。
